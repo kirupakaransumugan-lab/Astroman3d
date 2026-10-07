@@ -626,7 +626,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     // main meadow grass (two tuft variants for variety)
     const grassMat = vegMaterial(1.0);
     const tA = makeTuft(5, 4), tB = makeTuft(4, 4);
-    const N = Math.round(46000 * Q);
+    const N = Math.round(110000 * Q);
     const spots = scatter(N, (x, z) => meadowDensity(x, z));
     const half = Math.floor(spots.length / 2);
     const scaleFn = (s, x, z) => {
@@ -658,7 +658,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       }
       return mergeGeos(parts);
     })();
-    const stalkSpots = scatter(Math.round(5200 * Q), (x, z) => meadowDensity(x, z) * 0.9);
+    const stalkSpots = scatter(Math.round(10000 * Q), (x, z) => meadowDensity(x, z) * 0.9);
     instanceField(stalk, vegMaterial(1.4), stalkSpots, s => { const h = rand(0.9, 1.35); s.set(1, h, 1); }, c => c.setRGB(1, 1, 1).multiplyScalar(rand(0.8, 1.15)));
 
     // small wildflowers (white, pale violet, yellow)
@@ -786,6 +786,14 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   }
 
   // ---------- boulders ----------
+  const PERCHES = [];   // landing spots on top of the rocks, for the birds
+  const perchRay = new THREE.Raycaster();
+  function addPerch(m, x, z, s) {
+    m.updateMatrixWorld(true);
+    perchRay.set(new THREE.Vector3(x + rand(-0.15, 0.15) * s, m.position.y + 5, z + rand(-0.15, 0.15) * s), new THREE.Vector3(0, -1, 0));
+    const hit = perchRay.intersectObject(m)[0];
+    if (hit) PERCHES.push({ p: hit.point.clone(), taken: null });
+  }
   function makeRock(seed) {
     const g = new THREE.IcosahedronGeometry(1, 3);
     const p = g.attributes.position;
@@ -811,6 +819,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       const m = new THREE.Mesh(rg[i % 3], rockMat);
       m.position.set(x, heightAt(x, z) - 0.12 * s, z); m.scale.setScalar(s); m.rotation.y = i * 1.7;
       m.castShadow = true; m.receiveShadow = true; scene.add(m);
+      addPerch(m, x, z, s);
     });
   }
 
@@ -844,6 +853,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       OBST.push({ x, z, r: sc * 1.3, type: 'rocks' });
       const m = new THREE.Mesh(sg, rockMat2); m.position.set(x, heightAt(x, z) - 0.05, z); m.scale.setScalar(sc); m.rotation.y = i * 2.1;
       m.castShadow = true; m.receiveShadow = true; scene.add(m);
+      addPerch(m, x, z, sc);
     });
   }
 
@@ -2005,10 +2015,16 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       timer: rand(4, 9), lookTimer: rand(2, 5), headUp: 0, graze: 1, tailUp: 0, target: new THREE.Vector3(x, 0, z), seed: i * 3.7 });
   });
 
-  function makeSquirrel() {
-    const fur = furSolid(0xa4552a), cream = furSolid(0xeadbc4);
-    const tailM = new THREE.MeshStandardMaterial({ color: lin(0xb4652f), roughness: 1, normalMap: furN, normalScale: new THREE.Vector2(1.5, 1.5) });
-    const dark = new THREE.MeshStandardMaterial({ color: lin(0x6b3016), roughness: 1 });
+  // coat variants: red, eastern grey, and the melanistic black morph
+  const SQ_COATS = [
+    { fur: 0xa4552a, belly: 0xeadbc4, tail: 0xb4652f, tip: 0x6b3016 },
+    { fur: 0x7f7b75, belly: 0xece6dc, tail: 0x948d85, tip: 0x4a4541 },
+    { fur: 0x2f2825, belly: 0x5b4d43, tail: 0x3b322c, tip: 0x171210 }
+  ];
+  function makeSquirrel(coat = SQ_COATS[0]) {
+    const fur = furSolid(coat.fur), cream = furSolid(coat.belly);
+    const tailM = new THREE.MeshStandardMaterial({ color: lin(coat.tail), roughness: 1, normalMap: furN, normalScale: new THREE.Vector2(1.5, 1.5) });
+    const dark = new THREE.MeshStandardMaterial({ color: lin(coat.tip), roughness: 1 });
     const eye = new THREE.MeshStandardMaterial({ color: lin(0x050302), roughness: 0.04, envMap: envTex, envMapIntensity: 1.4 });
     const g = new THREE.Group(), body = new THREE.Group(); g.add(body);
     mk(new THREE.SphereGeometry(0.06, 16, 12), fur, 0, 0.075, 0, body).scale.set(0.72, 0.78, 1.25);
@@ -2046,15 +2062,81 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   }
   const trunkR = (tr, y) => { const f = Math.min(1, y / tr.h); return tr.baseR * tr.h * (1 - 0.75 * f) * (1 + 1.8 * Math.pow(1 - sstep(f, 0, 0.05), 2)) + 0.045; };
   const usedTrees = new Set();
-  [[-17, -7], [15, 9], [-15, 15], [19, -6], [7, 20], [-21, 1]].forEach(([x, z], i) => {
+  // the first six live at the forest edge; the rest on trees closer to the meadow paths, so they're easier to spot
+  [[-17, -7], [15, 9], [-15, 15], [19, -6], [7, 20], [-21, 1], [-11, -13], [12, -2], [-10, 8], [11, 15], [-4, 19], [4, -17]].forEach(([x, z], i) => {
     let home = null, bd = 1e9;
     for (const tr of nearTrees) { if (usedTrees.has(tr)) continue; const d = Math.hypot(tr.x - x, tr.z - z); if (d < bd) { bd = d; home = tr; } }
     if (!home) return; usedTrees.add(home);
     const toC = Math.atan2(-home.x, -home.z);
     const sx = home.x + Math.sin(toC) * 2.5, sz = home.z + Math.cos(toC) * 2.5;
-    wild.squirrels.push({ m: makeSquirrel(), home, tree: home, pos: new THREE.Vector3(sx, 0, sz), heading: toC, speed: 0, hop: 0, mode: 'forage', timer: rand(1, 3),
+    wild.squirrels.push({ m: makeSquirrel(SQ_COATS[i < 6 ? 0 : i % 3]), home, tree: home, pos: new THREE.Vector3(sx, 0, sz), heading: toC, speed: 0, hop: 0, mode: 'forage', timer: rand(1, 3),
       target: new THREE.Vector3(sx, 0, sz), y: 0, ang: 0, upright: 1, seed: i * 5.3, qd: new THREE.Quaternion() });
   });
+
+  // ---------- small birds that fly free over the meadow and rest on the rocks ----------
+  const BIRD_KINDS = [
+    { back: 0x5e5146, breast: 0xd0642a, belly: 0xe9e1d2, tip: 0x3f362f, beak: 0x2a2018 },   // robin
+    { back: 0x6b7f4e, breast: 0xd8bf3e, belly: 0xe4d672, tip: 0x3d6aa6, beak: 0x24201c },   // blue tit
+    { back: 0x7a5a3c, breast: 0xb4a894, belly: 0xd8cfbe, tip: 0x4a3524, beak: 0x3a3028 },   // sparrow
+    { back: 0x1d1b1b, breast: 0x242120, belly: 0x2b2826, tip: 0x121010, beak: 0xd98a1e }    // blackbird
+  ];
+  function makeBird(c) {
+    const back = furSolid(c.back), breast = furSolid(c.breast), pale = furSolid(c.belly), tip = furSolid(c.tip);
+    const horn = new THREE.MeshStandardMaterial({ color: lin(c.beak), roughness: 0.5 });
+    const eye = new THREE.MeshStandardMaterial({ color: lin(0x050302), roughness: 0.04, envMap: envTex, envMapIntensity: 1.4 });
+    const g = new THREE.Group(), body = new THREE.Group(); g.add(body);
+    mk(new THREE.SphereGeometry(0.05, 16, 12), back, 0, 0, 0, body).scale.set(0.82, 0.8, 1.35);
+    mk(new THREE.SphereGeometry(0.044, 14, 10), breast, 0, -0.008, 0.026, body).scale.set(0.84, 0.86, 1.0);
+    mk(new THREE.SphereGeometry(0.036, 12, 10), pale, 0, -0.022, -0.02, body).scale.set(0.8, 0.6, 1.2);
+    const head = new THREE.Group(); head.position.set(0, 0.036, 0.058); body.add(head);
+    mk(new THREE.SphereGeometry(0.031, 14, 12), back, 0, 0, 0, head);
+    mk(new THREE.SphereGeometry(0.026, 12, 10), breast, 0, -0.01, 0.01, head).scale.set(0.95, 0.8, 1);
+    { const bk = mk(new THREE.ConeGeometry(0.0075, 0.03, 8), horn, 0, -0.002, 0.04, head); bk.rotation.x = Math.PI / 2; }
+    for (const s of [-1, 1]) mk(new THREE.SphereGeometry(0.0062, 8, 6), eye, 0.021 * s, 0.006, 0.016, head, false);
+    const wings = [];
+    for (const s of [-1, 1]) {
+      const w = new THREE.Group(); w.position.set(0.032 * s, 0.018, 0.005); body.add(w);
+      mk(new THREE.SphereGeometry(0.05, 12, 8), back, 0.05 * s, 0, -0.008, w).scale.set(1.25, 0.14, 0.62);
+      mk(new THREE.SphereGeometry(0.04, 10, 6), tip, 0.085 * s, -0.002, -0.02, w).scale.set(1.0, 0.1, 0.45);
+      w.userData.s = s; wings.push(w);
+    }
+    const tail = new THREE.Group(); tail.position.set(0, 0.008, -0.06); body.add(tail);
+    mk(new THREE.SphereGeometry(0.04, 10, 6), tip, 0, 0, -0.035, tail).scale.set(0.75, 0.14, 1.1);
+    const legs = new THREE.Group(); legs.position.set(0, -0.035, 0.005); body.add(legs);
+    for (const s of [-1, 1]) mk(new THREE.CylinderGeometry(0.003, 0.003, 0.03, 5), horn, 0.014 * s, -0.015, 0, legs);
+    g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+    g.scale.setScalar(1.3);
+    scene.add(g);
+    return { g, body, head, wings, tail, legs };
+  }
+  const BIRD_FOOT = 0.07;   // body centre sits this high above whatever it stands on
+  // a spot in the air somewhere around the astronaut, so the birds stay in view while roaming freely
+  function birdWaypoint(B, c = state.pos) {
+    const a = rng() * Math.PI * 2, r = rand(3, 14), x = c.x + Math.sin(a) * r, z = c.z + Math.cos(a) * r;
+    B.wp.set(x, surfaceY(x, z) + rand(1.4, 4.5), z);
+  }
+  // a free rock, preferring ones near the astronaut
+  function pickPerch(c = state.pos) {
+    const free = PERCHES.filter(pc => !pc.taken);
+    if (!free.length) return null;
+    free.sort((a, b) => Math.hypot(a.p.x - c.x, a.p.z - c.z) - Math.hypot(b.p.x - c.x, b.p.z - c.z));
+    return free[Math.floor(rng() * Math.min(5, free.length))];
+  }
+  const birds = [], birdStart = new THREE.Vector3(0.5, 0, -2);   // `state` doesn't exist yet, so seed around his start point
+  for (let i = 0; i < (isSmall ? 4 : 7); i++) {
+    const B = {
+      m: makeBird(BIRD_KINDS[i % BIRD_KINDS.length]), pos: new THREE.Vector3(), vel: new THREE.Vector3(), wp: new THREE.Vector3(),
+      mode: 'fly', perch: null, flyT: rand(4, 12), restT: 0, landed: false,
+      flap: rng() * 6, glide: 0, burst: 0, yaw: rng() * 6, pitch: 0, seed: i * 2.9,
+      target: new THREE.Vector3(), tmp: new THREE.Vector3()
+    };
+    // about half start out sitting on a rock, the rest already on the wing
+    const pc = i % 2 === 0 ? pickPerch(birdStart) : null;
+    if (pc) { pc.taken = B; B.perch = pc; B.mode = 'rest'; B.landed = true; B.restT = rand(3, 12); B.pos.copy(pc.p); B.pos.y += BIRD_FOOT; }
+    else { const x = rand(-6, 6), z = rand(-6, 4); B.pos.set(x, heightAt(x, z) + rand(2, 4), z); }
+    birdWaypoint(B, birdStart);
+    birds.push(B);
+  }
 
   const wv = { a: new THREE.Vector3(), b: new THREE.Vector3(), c: new THREE.Vector3(), m: new THREE.Matrix4(), lamp: new THREE.Vector3(), dir: new THREE.Vector3() };
   function threatFrom(x, z) {
@@ -2198,6 +2280,84 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       const flick = Math.max(0, Math.sin(t * 2.3 + Sq.seed * 2)) > 0.92 ? 0.25 : 0;
       M.tail.forEach((sg, i) => { sg.rotation.x = 0.36 + Math.sin(t * 3 + i * 0.6 + Sq.seed) * 0.04 + flick * (i < 3 ? 1 : -0.5) + (Sq.mode === 'flee' ? -0.25 : 0); });
     });
+
+    updateBirds(dt, t);
+  }
+
+  function updateBirds(dt, t) { birds.forEach(B => updateBird(B, dt, t)); }
+
+  function updateBird(B, dt, t) {
+    const M = B.m;
+    // ----- decide: roam → pick a rock → land → rest → take off again -----
+    if (B.mode === 'fly') {
+      B.flyT -= dt;
+      if (B.pos.distanceTo(B.wp) < 1.2) birdWaypoint(B);
+      if (B.flyT <= 0) {
+        const pc = pickPerch();
+        if (pc) { pc.taken = B; B.perch = pc; B.mode = 'land'; } else B.flyT = rand(3, 6);
+      }
+    } else if (B.mode === 'rest') {
+      B.restT -= dt;
+      const th = threatFrom(B.pos.x, B.pos.z);
+      if (B.restT <= 0 || th.d < 2.4) {   // bored, or something big walked up: off it goes
+        B.perch.taken = null; B.perch = null; B.mode = 'fly'; B.landed = false;
+        B.vel.set(Math.sin(th.away) * 1.5, 2.2, Math.cos(th.away) * 1.5);
+        B.flyT = rand(6, 16); birdWaypoint(B);
+      }
+    }
+
+    const T = B.target;
+    if (B.mode === 'fly') T.copy(B.wp);
+    else { T.copy(B.perch.p); T.y += BIRD_FOOT; }
+
+    if (B.landed) {
+      B.pos.copy(T); B.vel.set(0, 0, 0);
+      if (Math.sin(t * 0.6 + B.seed) > 0.97) B.yaw += dt * 3;   // shuffles round on the rock now and then
+    } else {
+      // steer: cruise toward waypoints, ease in when coming down to a rock
+      const d = B.tmp.copy(T).sub(B.pos), dist = d.length();
+      const sp = B.mode === 'fly' ? 4.5 : Math.min(4.0, dist * 2.4);
+      d.multiplyScalar(sp / (dist || 1));
+      B.vel.lerp(d, Math.min(1, dt * (B.mode === 'fly' ? 1.8 : 4.5)));
+      if (B.mode === 'fly') B.vel.y -= 1.8 * dt * B.glide;   // undulating flight: sinks a little during each glide
+      birds.forEach(O => {   // keep a little personal space in the air
+        if (O === B || O.landed) return;
+        const ox = B.pos.x - O.pos.x, oy = B.pos.y - O.pos.y, oz = B.pos.z - O.pos.z, od = Math.hypot(ox, oy, oz);
+        if (od < 0.7 && od > 1e-3) { const k = (0.7 - od) / od * dt * 6; B.vel.x += ox * k; B.vel.y += oy * k; B.vel.z += oz * k; }
+      });
+      B.pos.addScaledVector(B.vel, dt);
+      const floor = surfaceY(B.pos.x, B.pos.z) + BIRD_FOOT;
+      if (B.pos.y < floor) { B.pos.y = floor; if (B.vel.y < 0) B.vel.y = 0; }
+      if (B.mode === 'land' && dist < 0.08) { B.mode = 'rest'; B.landed = true; B.restT = rand(5, 14); }
+      const hs = Math.hypot(B.vel.x, B.vel.z);
+      if (hs > 0.15) B.yaw += wrap(Math.atan2(B.vel.x, B.vel.z) - B.yaw) * Math.min(1, dt * 7);
+      B.pitch += (THREE.MathUtils.clamp(-Math.atan2(B.vel.y, hs + 0.5), -0.6, 0.6) - B.pitch) * Math.min(1, dt * 5);
+    }
+
+    // wings: bursts of fast flapping between short glides; folded along the back when landed
+    const climbing = B.vel.y > 0.4 || B.mode === 'land';
+    B.burst -= dt;
+    if (B.burst <= 0) { B.glide = (B.mode === 'fly' && !climbing && !B.glide) ? 1 : 0; B.burst = B.glide ? rand(0.35, 0.75) : rand(0.6, 1.4); }
+    const flapping = !B.landed && (climbing || !B.glide);
+    if (flapping) B.flap += dt * 22;
+    M.wings.forEach(w => {
+      const s = w.userData.s, open = flapping ? Math.sin(B.flap) + 0.15 : (B.landed ? 0 : 0.12);
+      w.rotation.y += ((B.landed ? 1.35 * s : 0) - w.rotation.y) * Math.min(1, dt * 12);
+      w.rotation.z = s * open;
+    });
+    M.legs.scale.y += ((B.landed || B.mode === 'land' ? 1 : 0.2) - M.legs.scale.y) * Math.min(1, dt * 8);
+    M.tail.rotation.x = B.landed ? -0.25 + Math.max(0, Math.sin(t * 3.1 + B.seed)) * 0.25 : 0.05 * Math.sin(B.flap);
+
+    // on the rock: pecks at the lichen, quick glances about
+    const peck = B.landed && Math.sin(t * 1.3 + B.seed) > 0.45;
+    const glance = Math.sin(t * 2.3 + B.seed * 1.7);
+    M.head.rotation.x = peck ? 0.9 + Math.max(0, Math.sin(t * 14)) * 0.35 : 0;
+    M.head.rotation.y = B.landed && !peck ? (glance > 0.5 ? 0.6 : glance < -0.5 ? -0.6 : 0) : 0;
+
+    M.g.position.copy(B.pos);
+    if (flapping) M.g.position.y += Math.sin(B.flap) * 0.008;
+    M.g.rotation.set(0, B.yaw, 0);
+    M.body.rotation.x = B.landed ? (peck ? 0.35 : -0.12) : B.pitch;
   }
 
   // ======================================================================
@@ -2753,6 +2913,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       seated: state.mode === 'seated' || state.mode === 'sitting',
       deer: wild.deer[0] ? DEER_STATUS[wild.deer[0].mode] : '—',
       dog: D.sit > 0.6 ? 'Sitting' : D.speed > 1.6 ? 'Catching up' : D.speed > 0.1 ? 'Following' : 'Waiting',
+      birds: (n => `${birds.length - n} flying · ${n} on rocks`)(birds.filter(b => b.landed).length),
       auto: state.auto, lamp: state.lamp, follow: state.follow
     };
     // Push to React immediately when a toggle changes (so buttons respond at once), otherwise ~7 times a second.

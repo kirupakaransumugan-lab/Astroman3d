@@ -5,7 +5,7 @@ import Dock from '../components/Dock.jsx';
 
 const INITIAL_HUD = {
   heading: '000°', walked: '0.0 m', o2: '98%', status: 'Walking', seated: false,
-  deer: 'Grazing', dog: 'Following', auto: true, lamp: true, follow: true
+  deer: 'Grazing', dog: 'Following', birds: '—', auto: true, lamp: true, follow: true
 };
 
 // Home page: the Lantern Walk 3D scene with its telemetry HUD and control dock.
@@ -39,7 +39,7 @@ export default function Home() {
         <h1>Lantern <span>Walk</span></h1>
         <p>
           An astronaut and his dog Kepler cross a moonlit meadow ringed by tall pines, where deer graze,
-          squirrels forage and a crashed spacecraft still burns, walking out to sit on a ledge at the
+          squirrels forage, small birds flit between the rocks and a crashed spacecraft still burns, walking out to sit on a ledge at the
           cliff edge and watch the full moon.
         </p>
       </div>

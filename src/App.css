@@ -17,7 +17,7 @@ img { max-width: 100%; }
 }
 html, body { height: 100%; }
 body { background: var(--night); color: var(--ink); font-family: var(--body); overflow: hidden; }
-.stage { position: fixed; inset: var(--nav-h) 0 0 0; }
+.stage { position: fixed; inset: 0; }   /* full screen: the scene shows through the transparent navbar */
 .stage canvas { display: block; width: 100%; height: 100%; touch-action: none; }
 
 .tag, .hud, .dock { position: fixed; z-index: 2; background: var(--panel); border: 1px solid var(--line);
@@ -48,24 +48,26 @@ body { background: var(--night); color: var(--ink); font-family: var(--body); ov
 .hint { position: fixed; z-index: 2; left: 50%; transform: translateX(-50%); bottom: calc(80px + env(safe-area-inset-bottom, 0px));
   font-size: 12px; color: var(--muted); text-align: center; width: max-content; max-width: calc(100vw - 32px);
   text-shadow: 0 1px 4px #000; pointer-events: none; transition: opacity 1s; }
-.loading { position: fixed; inset: var(--nav-h) 0 0 0; z-index: 5; display: grid; place-items: center; background: var(--night);
+.loading { position: fixed; inset: 0; z-index: 5; display: grid; place-items: center; background: var(--night);
   font-family: var(--display); letter-spacing: 0.12em; text-transform: uppercase; font-size: 13px; color: var(--muted); text-align: center; padding-inline: 16px; }
 .loading[hidden] { display: none; }
 .loading b { display: block; color: var(--amber); font-weight: 500; margin-bottom: 6px; }
 
 /* ---------- site chrome: navbar + watermark ---------- */
 .navbar { position: fixed; top: 0; left: 0; right: 0; z-index: 10; height: var(--nav-h); box-sizing: border-box;
-  padding: env(safe-area-inset-top, 0px) 16px 0; display: flex; align-items: center; justify-content: space-between; gap: 16px;
-  background: rgba(5, 8, 16, 0.92); border-bottom: 1px solid var(--line);
-  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+  padding: env(safe-area-inset-top, 0px) 16px 0; gap: 16px; background: transparent;
+  /* brand | links | (empty): the equal side columns keep the links at the true centre */
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; }
+.navbar .brand { justify-self: start; }
+.navbar .brand, .navbar nav a { text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85); }
 .brand { font-family: var(--display); font-weight: 600; font-size: 19px; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--ink); text-decoration: none; white-space: nowrap; }
 .brand span { color: var(--amber); }
 .navbar ul { list-style: none; margin: 0; padding: 0; display: flex; gap: 4px; }
 .navbar nav a { display: block; font-family: var(--display); font-weight: 500; font-size: 13px; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--muted); text-decoration: none; padding: 7px 12px; border-radius: 7px;
+  text-transform: uppercase; color: var(--ink); text-decoration: none; padding: 7px 12px; border-radius: 7px;
   border: 1px solid transparent; }
-.navbar nav a:hover { color: var(--ink); border-color: var(--line); }
+.navbar nav a:hover { color: var(--ink); border-color: var(--line); background: rgba(5, 8, 16, 0.35); }
 .navbar nav a.active { color: var(--amber); border-color: var(--amber-deep); }
 .navbar a:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .watermark { position: fixed; z-index: 20; right: 16px; bottom: calc(80px + env(safe-area-inset-bottom, 0px));
@@ -78,4 +80,5 @@ body { background: var(--night); color: var(--ink); font-family: var(--body); ov
   .hud { font-size: 10.5px; padding: 8px 10px; gap: 2px 10px; }
   .hint { bottom: calc(140px + env(safe-area-inset-bottom, 0px)); }
   .dock button { padding: 7px 10px; font-size: 12px; }
+  .brand { font-size: 15px; }
 }

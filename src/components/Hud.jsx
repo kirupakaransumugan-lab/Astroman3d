@@ -4,6 +4,7 @@ const ROWS = [
   ['Lantern', h => (h.lamp ? 'ON' : 'OFF'), 'warm'],
   ['Status', h => h.status],
   ['Kepler', h => h.dog],
+  ['Birds', h => h.birds],
   ['Deer', h => h.deer],
   ['Suit O₂', h => h.o2],
 ];
