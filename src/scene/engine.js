@@ -13,10 +13,12 @@ const THREE = { ...THREE_CORE, OrbitControls, EffectComposer, RenderPass, Shader
 /**
  * Builds the scene inside `stage` and starts the render loop.
  * @param {HTMLElement} stage container the canvas is appended to
- * @param {{ onHud?: (hud: object) => void }} opts
- * @returns controller with setters, moonView/toggleSit, and dispose()
+ * The build is procedural and heavy, so it runs in steps that yield to the browser between them: the page stays
+ * responsive and onProgress can drive a loading bar. Shaders are compiled before the first frame is shown.
+ * @param {{ onHud?: (hud: object) => void, onProgress?: (fraction: number, label: string) => void, isCancelled?: () => boolean }} opts
+ * @returns Promise of a controller with setters, moonView/toggleSit, and dispose()
  */
-export function createScene(stage, { onHud = () => {} } = {}) {
+export function createScene(stage, { onHud = () => {}, onProgress = () => {}, isCancelled = () => false } = {}) {
   const isSmall = Math.min(innerWidth, innerHeight) < 700 || /Mobi|Android/i.test(navigator.userAgent);
   const Q = isSmall ? 0.38 : 1;
   const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -45,7 +47,13 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     const c = { x: -9, z: -15 }, dir = { x: 0.5, z: 0.866 }, perp = { x: -0.866, z: 0.5 };
     const wing = { x: c.x + perp.x * 5.6 + dir.x * 1.6, z: c.z + perp.z * 5.6 + dir.z * 1.6 };
     const view = { x: c.x - perp.x * 5.4 - dir.x * 0.5, z: c.z - perp.z * 5.4 - dir.z * 0.5 };
-    return { c, dir, perp, wing, view };
+    // it came in low over the forest from the +dir side: one pine snapped off and smouldering, one felled into the meadow
+    const at = (al, lt) => ({ x: c.x + dir.x * al + perp.x * lt, z: c.z + dir.z * al + perp.z * lt });
+    const snag = at(42, 3.4), stump = at(36, -2.8);
+    // the felled pine lies from its stump back toward the wreck, turned a little aside
+    const fl = Math.hypot(dir.x + perp.x * 0.25, dir.z + perp.z * 0.25), fall = { dx: -(dir.x + perp.x * 0.25) / fl, dz: -(dir.z + perp.z * 0.25) / fl, len: 13 };
+    fall.x = stump.x + fall.dx * 0.45; fall.z = stump.z + fall.dz * 0.45;
+    return { c, dir, perp, wing, view, at, snag, stump, fall };
   })();
   function crashField(x, z) { const dx = x - CRASH.c.x, dz = z - CRASH.c.z; return { along: dx * CRASH.dir.x + dz * CRASH.dir.z, lat: dx * CRASH.perp.x + dz * CRASH.perp.z }; }
   function crashBurn(x, z) {
@@ -53,7 +61,8 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     const trail = Math.exp(-f.lat * f.lat / 6) * sstep(f.along, -8, -5.5) * (1 - sstep(f.along, 11, 19));
     const blast = 1 - sstep(Math.hypot(x - CRASH.c.x, z - CRASH.c.z), 3.5, 9);
     const wingB = 1 - sstep(Math.hypot(x - CRASH.wing.x, z - CRASH.wing.z), 1.2, 3.6);
-    return Math.min(1, Math.max(trail, blast, wingB));
+    const snagB = 0.75 * (1 - sstep(Math.hypot(x - CRASH.snag.x, z - CRASH.snag.z), 0.6, 2.4));
+    return Math.min(1, Math.max(trail, blast, wingB, snagB));
   }
   function crashBlocked(x, z, pad = 0) {
     const f = crashField(x, z);
@@ -85,7 +94,9 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     if (onSlab(x, z, 1.3)) return 0;
     const burnK = 1 - sstep(crashBurn(x, z), 0.5, 0.82);
     if (burnK <= 0) return 0;
-    return meadowDensity0(x, z) * burnK;
+    const F = CRASH.fall, ft = Math.max(0, Math.min(F.len * 0.4, (x - F.x) * F.dx + (z - F.z) * F.dz));
+    const trunkK = sstep(Math.hypot(x - F.x - F.dx * ft, z - F.z - F.dz * ft), 0.3, 0.85);
+    return meadowDensity0(x, z) * burnK * trunkK;
   }
   function meadowDensity0(x, z) {
     const r = Math.hypot(x, z);
@@ -139,21 +150,35 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   }
   `;
 
-  function start() {
+  async function start() {
   const listeners = [];
   const on = (target, type, fn) => { target.addEventListener(type, fn); listeners.push([target, type, fn]); };
   let rafId = 0, disposed = false, hudAt = -1, hudFlags = '';
   // ---------- renderer ----------
-  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  const canPost = !!(THREE.EffectComposer && THREE.RenderPass && THREE.ShaderPass && THREE.UnrealBloomPass);
+  // With post-processing the scene is drawn into the composer's multisampled target and only a full-screen quad reaches
+  // the canvas, so a multisampled canvas would cost memory and a resolve every frame without smoothing anything.
+  const renderer = new THREE.WebGLRenderer({ antialias: !canPost, powerPreference: 'high-performance' });
   // Render at the screen's full pixel density for a sharp image (capped at 2; beyond that the extra cost isn't visible).
-  const PR = Math.min(devicePixelRatio, isSmall ? 1.5 : 2);
+  // adaptResolution() may step this down on a device that can't hold the frame rate, and back up when it can.
+  const PR_MAX = Math.min(devicePixelRatio, isSmall ? 1.5 : 2), PR_MIN = Math.min(PR_MAX, 1);
+  let PR = PR_MAX;
   const prU = { value: PR }; // shared by point-sprite shaders
   renderer.setPixelRatio(PR);
   renderer.setSize(stage.clientWidth, stage.clientHeight);
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
   stage.appendChild(renderer.domElement);
-  const canPost = !!(THREE.EffectComposer && THREE.RenderPass && THREE.ShaderPass && THREE.UnrealBloomPass);
+  // yield to the browser between build steps so the page stays responsive and the loading bar can paint
+  const buildLog = []; let buildT = performance.now(), buildLabel = 'Renderer';
+  async function step(label, fraction) {
+    const now = performance.now(); buildLog.push([buildLabel, Math.round(now - buildT)]); buildLabel = label;
+    onProgress(fraction, label);
+    await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
+    buildT = performance.now();
+    if (isCancelled()) { renderer.dispose(); renderer.forceContextLoss(); renderer.domElement.remove(); throw Object.assign(new Error('cancelled'), { cancelled: true }); }
+  }
+  await step('Preparing the night', 0.03);
   if (!canPost) { renderer.outputEncoding = THREE.sRGBEncoding; renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.32; }
 
   const scene = new THREE.Scene();
@@ -204,6 +229,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.anisotropy = 4; return t;
   }
 
+  await step('Painting the sky', 0.06);
   // ======================================================================
   // SKY: gradient + Milky Way + procedural stars, star points, moon, mountains
   // ======================================================================
@@ -447,6 +473,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   moonLight.shadow.bias = -0.0006; moonLight.shadow.normalBias = 0.02;
   scene.add(moonLight, moonLight.target);
 
+  await step('Shaping the meadow', 0.16);
   // ======================================================================
   // TERRAIN
   // ======================================================================
@@ -502,6 +529,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     scene.add(valley);
   }
 
+  await step('Growing the grass', 0.22);
   // ======================================================================
   // VEGETATION: shared wind + parting shader
   // ======================================================================
@@ -567,17 +595,24 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     g.setAttribute('color', new THREE.BufferAttribute(c, 3)); return g;
   }
 
-  // grass tuft: curved, tapered blades with V-fold, darker at the root
-  function makeTuft(blades, segs) {
+  // grass tuft: curved, tapered blades with V-fold, darker at the root.
+  // Returns one geometry per entry of segList: the same blades, with that many segments along each blade.
+  function makeTuft(blades, segList) {
+    const B = [];
+    for (let b = 0; b < blades; b++) {
+      const ang = rng() * Math.PI * 2;
+      const lean = rand(0.05, 0.42), h = rand(0.62, 1.0), w = rand(0.012, 0.024);
+      const ox = rand(-0.07, 0.07), oz = rand(-0.07, 0.07);
+      const leanDir = ang + rand(-0.6, 0.6);
+      B.push({ lean, h, w, ox, oz, lx: Math.cos(leanDir), lz: Math.sin(leanDir), isDry: rng() < 0.14 });
+    }
+    return segList.map(n => buildTuft(B, n));
+  }
+  function buildTuft(B, segs) {
     const pos = [], nor = [], col = [], idx = [];
     const root = lin(0x101a08), mid = lin(0x3c5a1c), tip = lin(0x8aa548), dryTip = lin(0xa8955a);
     let vo = 0;
-    for (let b = 0; b < blades; b++) {
-      const ang = rng() * Math.PI * 2, ca = Math.cos(ang), sa = Math.sin(ang);
-      const lean = rand(0.05, 0.42), h = rand(0.62, 1.0), w = rand(0.012, 0.024);
-      const ox = rand(-0.07, 0.07), oz = rand(-0.07, 0.07);
-      const leanDir = ang + rand(-0.6, 0.6), lx = Math.cos(leanDir), lz = Math.sin(leanDir);
-      const isDry = rng() < 0.14;
+    for (const { lean, h, w, ox, oz, lx, lz, isDry } of B) {
       for (let i = 0; i <= segs; i++) {
         const t = i / segs, y = t * h * (1 - lean * 0.35 * t * t);
         const off = lean * t * t * h;
@@ -609,23 +644,69 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     return out;
   }
   const tmpM = new THREE.Matrix4(), tmpQ = new THREE.Quaternion(), tmpS = new THREE.Vector3(), tmpP = new THREE.Vector3(), UP = new THREE.Vector3(0, 1, 0);
-  function instanceField(geo, mat, spots, scaleFn, tintFn) {
-    const im = new THREE.InstancedMesh(geo, mat, spots.length);
-    const col = new THREE.Color();
-    spots.forEach(([x, z], i) => {
+  // Instanced vegetation is split into square tiles, each with its own bounding sphere, so the renderer can cull the
+  // tiles that are off screen (one InstancedMesh spanning the whole meadow can never be culled, so all of it was drawn
+  // every frame). With a lodGeo, tiles beyond lodDist from the camera draw that lighter geometry instead; both levels
+  // share one instance buffer, so the swap costs no memory and the blades stay exactly where they were.
+  const vegTiles = [];
+  function tiledInstances(geo, mat, mats, cols, { cell = 8, lods = [], pad = 0.6 } = {}) {
+    if (!geo.boundingSphere) geo.computeBoundingSphere();
+    const gs = geo.boundingSphere, buckets = new Map();
+    mats.forEach((m, i) => {
+      const key = Math.floor(m.elements[12] / cell) + ',' + Math.floor(m.elements[14] / cell);
+      let b = buckets.get(key); if (!b) buckets.set(key, b = []); b.push(i);
+    });
+    const c = new THREE.Vector3(), lo = new THREE.Vector3(), hi = new THREE.Vector3();
+    for (const idx of buckets.values()) {
+      const box = new THREE.Box3();
+      const iMat = new THREE.InstancedBufferAttribute(new Float32Array(idx.length * 16), 16);
+      const iCol = cols ? new THREE.InstancedBufferAttribute(new Float32Array(idx.length * 3), 3) : null;
+      idx.forEach((i, k) => {
+        const m = mats[i]; m.toArray(iMat.array, k * 16);
+        if (iCol) cols[i].toArray(iCol.array, k * 3);
+        const r = gs.radius * m.getMaxScaleOnAxis() + pad; c.copy(gs.center).applyMatrix4(m);
+        box.expandByPoint(lo.set(c.x - r, c.y - r, c.z - r)); box.expandByPoint(hi.set(c.x + r, c.y + r, c.z + r));
+      });
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      const level = (g) => {
+        // a light wrapper per tile: shares the attribute buffers, carries the tile's own bounds
+        const tg = new THREE.BufferGeometry();
+        for (const k in g.attributes) tg.setAttribute(k, g.attributes[k]);
+        tg.setIndex(g.index); tg.boundingSphere = sphere;
+        const im = new THREE.InstancedMesh(tg, mat, idx.length);
+        im.instanceMatrix = iMat; if (iCol) im.instanceColor = iCol;
+        im.receiveShadow = true; scene.add(im); return im;
+      };
+      const levels = [level(geo), ...lods.map(([g]) => { const im = level(g); im.visible = false; return im; })];
+      if (lods.length) vegTiles.push({ c: sphere.center, levels, d2: lods.map(([, d]) => d * d), cur: 0, n: idx.length });
+    }
+  }
+  // vegDensity < 1 only on a GPU that can't keep up (see adaptQuality): beyond the first LOD distance a tile then draws
+  // just the first part of its instances; they're in random order, so the field thins evenly. Near grass stays full.
+  let vegDensity = 1;
+  function updateVegLOD(eye) {
+    for (const T of vegTiles) {
+      const d2 = T.c.distanceToSquared(eye); let k = 0;
+      while (k < T.d2.length && d2 > T.d2[k]) k++;
+      if (k !== T.cur) { T.levels[T.cur].visible = false; T.levels[k].visible = true; T.cur = k; }
+      T.levels[k].count = k ? Math.ceil(T.n * vegDensity) : T.n;
+    }
+  }
+  function instanceField(geo, mat, spots, scaleFn, tintFn, opts) {
+    const mats = [], cols = [];
+    spots.forEach(([x, z]) => {
       tmpP.set(x, heightAt(x, z) - 0.02, z);
       tmpQ.setFromAxisAngle(UP, rng() * Math.PI * 2);
       scaleFn(tmpS, x, z);
-      tmpM.compose(tmpP, tmpQ, tmpS); im.setMatrixAt(i, tmpM);
-      tintFn(col, x, z); im.setColorAt(i, col);
+      mats.push(new THREE.Matrix4().compose(tmpP, tmpQ, tmpS));
+      const col = new THREE.Color(); tintFn(col, x, z); cols.push(col);
     });
-    im.frustumCulled = false; im.receiveShadow = true;
-    scene.add(im); return im;
+    tiledInstances(geo, mat, mats, cols, opts);
   }
   {
     // main meadow grass (two tuft variants for variety)
     const grassMat = vegMaterial(1.0);
-    const tA = makeTuft(5, 4), tB = makeTuft(4, 4);
+    const [tA, tA3, tA2] = makeTuft(5, [4, 3, 2]), [tB, tB3, tB2] = makeTuft(4, [4, 3, 2]);
     const N = Math.round(110000 * Q);
     const spots = scatter(N, (x, z) => meadowDensity(x, z));
     const half = Math.floor(spots.length / 2);
@@ -640,26 +721,31 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       c.setRGB(1, 1, 1).lerp(new THREE.Color(1.25, 1.05, 0.7), dryness * 0.8).multiplyScalar(rand(0.78, 1.18));
       const bn = crashBurn(x, z); if (bn > 0) c.lerp(new THREE.Color(0.32, 0.2, 0.11), bn).multiplyScalar(1 - 0.45 * bn);
     };
-    instanceField(tA, grassMat, spots.slice(0, half), scaleFn, tintFn);
-    instanceField(tB, grassMat, spots.slice(half), scaleFn, tintFn);
+    instanceField(tA, grassMat, spots.slice(0, half), scaleFn, tintFn, { lods: [[tA3, 14], [tA2, 30]] });
+    instanceField(tB, grassMat, spots.slice(half), scaleFn, tintFn, { lods: [[tB3, 14], [tB2, 30]] });
 
     // seed-head grass stalks poking above the meadow
-    const stalk = (() => {
-      const parts = [];
-      const stem = new THREE.CylinderGeometry(0.0025, 0.004, 1, 3, 3, true); stem.translate(0, 0.5, 0);
-      paint(stem, (c, x, y) => c.copy(lin(0x2c3c18)).lerp(lin(0x8a7d4a), y));
-      parts.push(stem);
-      for (let k = 0; k < 5; k++) {
-        const head = new THREE.SphereGeometry(1, 5, 4); head.scale(0.009, 0.05, 0.009);
-        head.rotateZ(rand(-0.5, 0.5)); head.rotateY(k * 1.3);
-        head.translate(Math.sin(k * 1.3) * 0.012, 0.9 + k * 0.03, Math.cos(k * 1.3) * 0.012);
-        paint(head, c => c.copy(lin(0xb3a26a)));
-        parts.push(head);
-      }
-      return mergeGeos(parts);
+    // [full, mid, far]: the same seed heads with fewer facets further away
+    const [stalk, stalkMid, stalkLod] = (() => {
+      const tilt = [0, 1, 2, 3, 4].map(() => rand(-0.5, 0.5));
+      const build = (stemH, hw, hh) => {
+        const parts = [];
+        const stem = new THREE.CylinderGeometry(0.0025, 0.004, 1, 3, stemH, true); stem.translate(0, 0.5, 0);
+        paint(stem, (c, x, y) => c.copy(lin(0x2c3c18)).lerp(lin(0x8a7d4a), y));
+        parts.push(stem);
+        for (let k = 0; k < 5; k++) {
+          const head = new THREE.SphereGeometry(1, hw, hh); head.scale(0.009, 0.05, 0.009);
+          head.rotateZ(tilt[k]); head.rotateY(k * 1.3);
+          head.translate(Math.sin(k * 1.3) * 0.012, 0.9 + k * 0.03, Math.cos(k * 1.3) * 0.012);
+          paint(head, c => c.copy(lin(0xb3a26a)));
+          parts.push(head);
+        }
+        return mergeGeos(parts);
+      };
+      return [build(3, 5, 4), build(2, 4, 3), build(1, 3, 3)];
     })();
     const stalkSpots = scatter(Math.round(10000 * Q), (x, z) => meadowDensity(x, z) * 0.9);
-    instanceField(stalk, vegMaterial(1.4), stalkSpots, s => { const h = rand(0.9, 1.35); s.set(1, h, 1); }, c => c.setRGB(1, 1, 1).multiplyScalar(rand(0.8, 1.15)));
+    instanceField(stalk, vegMaterial(1.4), stalkSpots, s => { const h = rand(0.9, 1.35); s.set(1, h, 1); }, c => c.setRGB(1, 1, 1).multiplyScalar(rand(0.8, 1.15)), { lods: [[stalkMid, 12], [stalkLod, 26]] });
 
     // small wildflowers (white, pale violet, yellow)
     const flowerGeo = (petal) => {
@@ -672,10 +758,11 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     };
     [0xf2efe6, 0xb9a8e6, 0xf0cf4a].forEach((pc, i) => {
       const sp = scatter(Math.round(900 * Q), (x, z) => meadowDensity(x, z) * (0.4 + 0.6 * sstep(fbm3(x * 0.15, z * 0.15, 20 + i, 2), 0.5, 0.7)));
-      instanceField(flowerGeo(pc), vegMaterial(1.1), sp, s => { const h = rand(0.35, 0.7); s.set(rand(0.8, 1.3), h, rand(0.8, 1.3)); }, c => c.setRGB(1, 1, 1));
+      instanceField(flowerGeo(pc), vegMaterial(1.1), sp, s => { const h = rand(0.35, 0.7); s.set(rand(0.8, 1.3), h, rand(0.8, 1.3)); }, c => c.setRGB(1, 1, 1), { cell: 20 });
     });
   }
 
+  await step('Planting the pines', 0.42);
   // ======================================================================
   // (nearTrees is filled below and used by the squirrels)
   // TREES: procedural conifers (bark trunk + drooping branch tiers), 3 species + far LOD
@@ -686,7 +773,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     const tp = trunk.attributes.position;
     for (let i = 0; i < tp.count; i++) {
       const x = tp.getX(i), y = tp.getY(i), z = tp.getZ(i), a = Math.atan2(z, x);
-      const flare = 1 + 1.8 * Math.pow(1 - sstep(y, 0, 0.05), 2);
+      const flare = 1 + (o.flare ?? 1.8) * Math.pow(1 - sstep(y, 0, 0.05), 2);
       const k = (1 + (vnoise3(Math.cos(a) * 3, y * 25, o.seed) - 0.5) * 0.3) * flare;
       tp.setX(i, x * k); tp.setZ(i, z * k);
     }
@@ -762,6 +849,8 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       const r = isFar ? rand(46, 85) : rand(20.5, 46), a = rng() * Math.PI * 2;
       const x = Math.cos(a) * r, z = Math.sin(a) * r;
       if (corridorOpen(x, z) || inMeadow(x, z, -1.5)) continue;
+      { const f = crashField(x, z); if (f.along > 30 && f.along < 80 && Math.abs(f.lat) < 4.6 + (f.along - 30) * 0.05) continue; }
+      if (Math.hypot(x - CRASH.snag.x, z - CRASH.snag.z) < 2.6 || Math.hypot(x - CRASH.stump.x, z - CRASH.stump.z) < 2.6) continue;
       const minD = isFar ? 4.2 : 3.1;
       if (placed.some(p => (p[0] - x) ** 2 + (p[1] - z) ** 2 < minD * minD)) continue;
       placed.push([x, z]);
@@ -773,15 +862,13 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     }
     for (const k in lists) {
       const L = lists[k]; if (!L.length) continue;
-      const im = new THREE.InstancedMesh(geos[k], treeMat, L.length);
-      L.forEach(([x, z, h], i) => {
+      const mats = L.map(([x, z, h]) => {
         tmpP.set(x, heightAt(x, z) - 0.15, z);
         tmpQ.setFromAxisAngle(UP, rng() * Math.PI * 2);
         const w = h * rand(0.88, 1.15); tmpS.set(w, h, w * rand(0.9, 1.1));
-        tmpM.compose(tmpP, tmpQ, tmpS); im.setMatrixAt(i, tmpM);
+        return new THREE.Matrix4().compose(tmpP, tmpQ, tmpS);
       });
-      im.frustumCulled = false; im.receiveShadow = true;
-      scene.add(im);
+      tiledInstances(geos[k], treeMat, mats, null, { cell: k === 'far' ? 24 : 14, pad: 1.5 });
     }
   }
 
@@ -885,6 +972,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     } };
   })();
 
+  await step('Suiting up the astronaut', 0.55);
   // ======================================================================
   // ASTRONAUT (procedural EVA suit)
   // ======================================================================
@@ -921,6 +1009,78 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   function mk(geo, mat, x = 0, y = 0, z = 0, parent = null, shadow = true) {
     const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = shadow; m.receiveShadow = true;
     if (parent) parent.add(m); return m;
+  }
+  // Bake a rig's static parts together. Only a rig's bones (the Groups the animation code moves) ever change pose;
+  // every other mesh, however deeply nested in static groups (rings, finger segments, housings), is fixed relative to
+  // its nearest bone. So each mesh is re-expressed in its bone's frame and, per bone, meshes sharing a material and
+  // shadow settings become one mesh. The rig looks and moves exactly as before with far fewer draw calls, and each
+  // call saved is saved again in every shadow pass. The emptied static groups stay in place, so code that reads their
+  // positions (the lantern hangs from armR.hand) still works. Meshes in `keep` (shown/hidden at runtime) stay as they are.
+  const rigParts = (...xs) => xs.flatMap(x => !x ? [] : x.isObject3D ? [x] : Array.isArray(x) ? rigParts(...x) : Object.values(x).filter(v => v && v.isObject3D));
+  function mergeRig(root, { bones = [], keep = [] } = {}) {
+    const B = new Set([root, ...bones]), skip = new Set(keep), buckets = new Map();
+    root.updateMatrixWorld(true);
+    root.traverse(c => {
+      if (!c.isMesh || c.isInstancedMesh || c.isSkinnedMesh || c.children.length || skip.has(c) || B.has(c) || Array.isArray(c.material)) return;
+      let bone = c.parent, shown = c.visible;
+      while (!B.has(bone)) { shown = shown && bone.visible; bone = bone.parent; }
+      if (!shown) return;
+      const a = c.geometry.attributes, sig = Object.keys(a).sort().map(k => k + a[k].itemSize).join();
+      const key = bone.uuid + '|' + c.material.uuid + '|' + c.castShadow + c.receiveShadow + c.renderOrder + c.frustumCulled + '|' + sig;
+      let b = buckets.get(key); if (!b) buckets.set(key, b = { bone, list: [] }); b.list.push(c);
+    });
+    const inv = new THREE.Matrix4();
+    for (const { bone, list } of buckets.values()) {
+      if (list.length < 2 && list[0].parent === bone) continue;
+      inv.copy(bone.matrixWorld).invert();
+      const merged = new THREE.Mesh(mergeBaked(list.map(c => [c.geometry, new THREE.Matrix4().multiplyMatrices(inv, c.matrixWorld)])), list[0].material);
+      merged.castShadow = list[0].castShadow; merged.receiveShadow = list[0].receiveShadow; merged.renderOrder = list[0].renderOrder;
+      list.forEach(c => c.parent.remove(c)); bone.add(merged);
+    }
+    // Shadow passes only care which faces a mesh casts with (its material's shadow side), so per bone and shadow side
+    // the casting meshes get one shadow-only copy (positions only), kept on SHADOW_LAYER: the shadow cameras see it,
+    // the main camera doesn't. Identical shadows for a fraction of the draws, and the point lights render every
+    // caster six times a frame.
+    for (const bone of B) {
+      const bySide = new Map();
+      for (const c of bone.children) {
+        if (!c.isMesh || c.isInstancedMesh || !c.castShadow || skip.has(c) || !c.visible || c.children.length || Array.isArray(c.material)) continue;
+        const side = c.material.shadowSide !== null ? c.material.shadowSide : SHADOW_SIDE_OF[c.material.side];
+        (bySide.get(side) || bySide.set(side, []).get(side)).push(c);
+      }
+      for (const [side, casters] of bySide) {
+        if (casters.length < 2) continue;
+        const proxy = new THREE.Mesh(mergeBaked(casters.map(c => { c.updateMatrix(); return [c.geometry, c.matrix]; }), ['position']), shadowProxyMat[side]);
+        proxy.castShadow = true; proxy.receiveShadow = false; proxy.layers.set(SHADOW_LAYER);
+        casters.forEach(c => { c.castShadow = false; });
+        bone.add(proxy);
+      }
+    }
+  }
+  const SHADOW_LAYER = 1;
+  // what three.js renders in a shadow pass for each material side (when the material sets no shadowSide)
+  const SHADOW_SIDE_OF = { [THREE.FrontSide]: THREE.BackSide, [THREE.BackSide]: THREE.FrontSide, [THREE.DoubleSide]: THREE.DoubleSide };
+  const shadowProxyMat = Object.fromEntries([THREE.FrontSide, THREE.BackSide, THREE.DoubleSide].map(sd => [sd, new THREE.MeshBasicMaterial({ shadowSide: sd })]));
+  function mergeBaked(items, only = null) {
+    const parts = items.map(([geo, m]) => {
+      let g = geo.clone();
+      if (only) for (const k of Object.keys(g.attributes)) if (!only.includes(k)) g.deleteAttribute(k);
+      g = g.applyMatrix4(m); const n = g.attributes.position.count;
+      if (!g.index) { const ix = new Uint32Array(n); for (let i = 0; i < n; i++) ix[i] = i; g.setIndex(new THREE.BufferAttribute(ix, 1)); }
+      if (m.determinant() < 0) { const ix = g.index.array; for (let i = 0; i < ix.length; i += 3) { const t = ix[i + 1]; ix[i + 1] = ix[i + 2]; ix[i + 2] = t; } }
+      return g;
+    });
+    const out = new THREE.BufferGeometry();
+    for (const k in parts[0].attributes) {
+      const size = parts[0].attributes[k].itemSize, arr = new Float32Array(parts.reduce((n, g) => n + g.attributes[k].count * size, 0));
+      let o = 0; for (const g of parts) { arr.set(g.attributes[k].array, o); o += g.attributes[k].count * size; }
+      out.setAttribute(k, new THREE.BufferAttribute(arr, size));
+    }
+    const idx = new Uint32Array(parts.reduce((n, g) => n + g.index.count, 0));
+    let io = 0, vo = 0;
+    for (const g of parts) { const a = g.index.array; for (let i = 0; i < a.length; i++) idx[io++] = a[i] + vo; vo += g.attributes.position.count; }
+    out.setIndex(new THREE.BufferAttribute(idx, 1));
+    return out;
   }
   function lathe(pts, segs = 32) {
     const s = pts.slice().sort((a, b) => a[1] - b[1]);
@@ -1084,6 +1244,8 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   }
   const legL = makeLeg(1), legR = makeLeg(-1);
 
+  mergeRig(astro, { bones: rigParts(aBody, pelvis, torso, head, legL, legR, armL, armR) });
+
   // ======================================================================
   // LANTERN (hurricane style)
   // ======================================================================
@@ -1242,6 +1404,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   // lantern swing: a real pendulum (Verlet with a length constraint) hung from the moving hand
   const lanternPhys = { b: new THREE.Vector3(), bp: new THREE.Vector3(), piv: new THREE.Vector3(), vPrev: new THREE.Vector3(), bFrame: new THREE.Vector3(), acc: new THREE.Vector3(), L: 0.22, init: false, yaw: 0 };
 
+  await step('Waking Kepler', 0.62);
   // ======================================================================
   // DOG — "Kepler", a golden retriever
   // ======================================================================
@@ -1336,7 +1499,9 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     }
   }
   dog.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  mergeRig(dog, { bones: rigParts(dRoot, dNeck, dHead, jaw, ears, fl, fr, hl, hr, tailSegs), keep: [tongue] });
 
+  await step('Landing the wreck', 0.66);
   // ======================================================================
   // CRASHED SPACECRAFT: hull broken in two, torn ribs and cables, burning, sparking
   // ======================================================================
@@ -1659,7 +1824,10 @@ export function createScene(stage, { onHud = () => {} } = {}) {
         tmpP.set(x, heightAt(x, z) - sc * 0.25, z); tmpQ.setFromEuler(new THREE.Euler(rng() * 3, rng() * 6, rng() * 3)); tmpS.set(sc, sc * rand(0.6, 1), sc);
         tmpM.compose(tmpP, tmpQ, tmpS); im.setMatrixAt(i, tmpM);
       }
-      im.castShadow = true; im.receiveShadow = true; im.frustumCulled = false; scene.add(im); }
+      // bounds covering every piece, so the shadow cameras (and the main camera) can skip the field when it's out of view
+      { const box = new THREE.Box3(), v = new THREE.Vector3(); for (let i = 0; i < N; i++) { im.getMatrixAt(i, tmpM); box.expandByPoint(v.setFromMatrixPosition(tmpM)); }
+        im.geometry.boundingSphere = box.expandByScalar(0.6).getBoundingSphere(new THREE.Sphere()); }
+      im.castShadow = true; im.receiveShadow = true; scene.add(im); }
     { const N = isSmall ? 30 : 60;
       W.emberMat = new THREE.MeshBasicMaterial({ map: glowTexture(255, 120, 40), color: new THREE.Color(2.4, 0.7, 0.15), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
       const eg = new THREE.PlaneGeometry(1, 1); eg.rotateX(-Math.PI / 2);
@@ -1783,6 +1951,114 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     particles([{ p: gapP, r: 0.6, h: 17, size: 2.4, n: 120 }, { p: noseP, r: 0.5, h: 12, size: 1.9, n: 75 }, { p: wingP, r: 0.4, h: 7, size: 1.3, n: 40 }, { p: engP, r: 0.3, h: 6, size: 1.0, n: 32 },
                ...trail.map(p => ({ p, r: 0.3, h: 4, size: 0.8, n: 14 }))], 'smoke');
     particles([{ p: gapP, r: 0.8, h: 6, size: 0.05, n: 90 }, { p: noseP, r: 0.6, h: 4.5, size: 0.045, n: 50 }, { p: wingP, r: 0.4, h: 3, size: 0.04, n: 25 }], 'ember');
+
+    // ---------- its approach: a pine snapped off and smouldering, another felled into the meadow ----------
+    {
+      const barkC = lin(0x3a2c22), barkC2 = lin(0x6a5848), woodC = lin(0xcaa772), charC = lin(0x0d0b0a), charC2 = lin(0x2a2420);
+      const woodMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, normalMap: furN, normalScale: new THREE.Vector2(0.4, 0.4) });
+      // a trunk section whose top end is torn off jaggedly; the end face shows raw (or burnt) wood
+      function brokenTrunk(rB, rT, len, jag, burnt, seed) {
+        const g = new THREE.CylinderGeometry(rT, rB, len, 14, 8); g.translate(0, len / 2, 0);
+        paint(g, (c, x, y, z, i) => {
+          const a = Math.atan2(z, x), n = vnoise3(Math.cos(a) * 5, y * 6, seed);
+          if (g.attributes.normal.getY(i) > 0.5) c.copy(burnt ? charC2 : woodC).multiplyScalar(0.8 + 0.4 * n);
+          else { c.copy(barkC).lerp(barkC2, n * 0.7); if (burnt) c.lerp(charC, Math.min(1, Math.max(0, 0.55 + 0.6 * y / len + (n - 0.5)))); }
+        });
+        const pp = g.attributes.position;
+        for (let i = 0; i < pp.count; i++) {
+          const x = pp.getX(i), y = pp.getY(i), z = pp.getZ(i);
+          if (y > len - 1e-3) { const a = Math.atan2(z, x), r = Math.hypot(x, z);
+            pp.setY(i, y - jag * (r < 1e-3 ? 0.5 : vnoise3(Math.cos(a) * 2.5, Math.sin(a) * 2.5, seed + 9))); }
+        }
+        g.computeVertexNormals(); return g;
+      }
+      // long splinters standing up round the rim of a break
+      function splinters(n, R, y0, len, col) {
+        const parts = [];
+        for (let k = 0; k < n; k++) {
+          const a = k / n * Math.PI * 2 + rand(-0.3, 0.3), L = len * rand(0.4, 1.1);
+          const sg = new THREE.ConeGeometry(rand(0.025, 0.06), L, 4); sg.translate(0, L / 2, 0);
+          const sh = rand(0.75, 1.15); paint(sg, c => c.copy(col).multiplyScalar(sh));
+          sg.rotateZ(-rand(0.05, 0.4)); sg.rotateY(-a);
+          sg.translate(Math.cos(a) * R * 0.75, y0 - rand(0, len * 0.4), Math.sin(a) * R * 0.75);
+          parts.push(sg);
+        }
+        return mergeGeos(parts);
+      }
+      const flare = (rTop, rBot, h) => { const g = new THREE.CylinderGeometry(rTop, rBot, h, 14); g.translate(0, h / 2, 0); paint(g, (c, x, y, z) => c.copy(barkC).lerp(barkC2, vnoise3(x * 6, y * 6, z * 6) * 0.6)); return g; };
+      // lay a mesh down so its local +y runs from `from` along the ground in direction dirH; local z ends up vertical
+      const basis = new THREE.Matrix4();
+      function layDown(obj, from, dirH, len, lift) {
+        const to = from.clone().addScaledVector(dirH, len);
+        from.y = heightAt(from.x, from.z) + lift; to.y = heightAt(to.x, to.z) + lift;
+        const yA = to.sub(from).normalize(), zA = new THREE.Vector3(0, 1, 0).addScaledVector(yA, -yA.y).normalize(), xA = new THREE.Vector3().crossVectors(yA, zA);
+        obj.quaternion.setFromRotationMatrix(basis.makeBasis(xA, yA, zA)); obj.position.copy(from);
+      }
+      const back = new THREE.Vector3(-CRASH.dir.x, 0, -CRASH.dir.z);   // the way the craft was travelling
+
+      // --- the snag: snapped at ~7 m, charred, leaning the way the craft went, still smouldering at the break
+      const SH = 7.2, snag = new THREE.Group();
+      snag.position.set(CRASH.snag.x, heightAt(CRASH.snag.x, CRASH.snag.z) - 0.2, CRASH.snag.z);
+      snag.quaternion.setFromUnitVectors(UP, new THREE.Vector3(0, 1, 0).addScaledVector(back, 0.09).normalize());
+      scene.add(snag);
+      mk(brokenTrunk(0.42, 0.3, SH, 1.1, true, 3), woodMat, 0, 0, 0, snag);
+      mk(splinters(9, 0.3, SH - 0.45, 0.9, charC2), woodMat, 0, 0, 0, snag);
+      mk(flare(0.42, 0.78, 0.55), woodMat, 0, 0, 0, snag);
+      for (let k = 0; k < 7; k++) {   // bare, burnt branch stubs
+        const s = new THREE.Group(); s.position.y = rand(2.4, SH - 1.4); s.rotation.y = rng() * Math.PI * 2; snag.add(s);
+        mk(brokenTrunk(0.06, 0.035, rand(0.4, 1.3), 0.12, true, 10 + k), woodMat, 0, 0, 0, s).rotation.z = -rand(1.0, 1.4);
+      }
+      const coalMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(2.4, 0.7, 0.15) });
+      for (let k = 0; k < 10; k++) {   // coals glowing in the broken top
+        const a = rng() * Math.PI * 2, r = rand(0.05, 0.28);
+        mk(new THREE.SphereGeometry(rand(0.03, 0.07), 6, 5), coalMat, Math.cos(a) * r, SH - rand(0.35, 0.9), Math.sin(a) * r, snag, false).scale.y = 0.5;
+      }
+      mergeRig(snag);
+      snag.updateMatrixWorld(true);
+      const snagTop = snag.localToWorld(new THREE.Vector3(0, SH - 0.5, 0));
+      OBST.push({ x: CRASH.snag.x, z: CRASH.snag.z, r: 0.8, type: 'tree' });
+      // its top, thrown down beside it; the torn end points back at the snag
+      const topPiece = new THREE.Group(); scene.add(topPiece);
+      const tDir = back.clone().applyAxisAngle(UP, 0.6).negate();
+      const tFrom = new THREE.Vector3(CRASH.snag.x, 0, CRASH.snag.z).addScaledVector(tDir, -6.8);
+      layDown(topPiece, tFrom, tDir, 5.6, 0.2);
+      mk(brokenTrunk(0.1, 0.28, 5.6, 0.7, true, 21), woodMat, 0, 0, 0, topPiece);
+      mk(splinters(7, 0.28, 5.4, 0.7, charC2), woodMat, 0, 0, 0, topPiece);
+      topPiece.updateMatrixWorld(true);
+      const pieceEnd = topPiece.localToWorld(new THREE.Vector3(0, 5.3, 0));
+      for (let k = 0; k < 6; k++) OBST.push({ x: tFrom.x + tDir.x * k, z: tFrom.z + tDir.z * k, r: 0.45, type: 'tree' });
+
+      particles([{ p: snagTop, r: 0.22, h: 10, size: 1.5, n: 55 }, { p: pieceEnd, r: 0.2, h: 4, size: 0.8, n: 14 }], 'smoke');
+      particles([{ p: snagTop.clone().add(new THREE.Vector3(0, -0.35, 0)), r: 0.2, h: 0.45, size: 0.32, n: 30 }], 'flame');
+      particles([{ p: snagTop, r: 0.3, h: 3.5, size: 0.04, n: 22 }], 'ember');
+      W.snagLight = new THREE.PointLight(lin(0xff6a20), 1.2, 8, 2); W.snagLight.position.copy(snagTop).add(new THREE.Vector3(0, 0.3, 0)); scene.add(W.snagLight);
+      W.coalMat = coalMat;
+
+      // --- the felled pine: a splintered stump, and the tree lying in the grass where it came down
+      const stump = new THREE.Group(); stump.position.set(CRASH.stump.x, heightAt(CRASH.stump.x, CRASH.stump.z) - 0.1, CRASH.stump.z); scene.add(stump);
+      mk(brokenTrunk(0.34, 0.29, 0.9, 0.45, false, 7), woodMat, 0, 0, 0, stump);
+      mk(splinters(8, 0.29, 0.8, 0.65, woodC), woodMat, 0, 0, 0, stump);
+      mk(flare(0.34, 0.62, 0.4), woodMat, 0, 0, 0, stump);
+      OBST.push({ x: CRASH.stump.x, z: CRASH.stump.z, r: 0.55, type: 'tree' });
+      const FH = CRASH.fall.len, FW = FH * 0.95;
+      const fDir = new THREE.Vector3(CRASH.fall.dx, 0, CRASH.fall.dz), fFrom = new THREE.Vector3(CRASH.fall.x, 0, CRASH.fall.z);
+      const fallen = new THREE.Mesh(makePine({ seed: 7, whorls: Math.round(24 * (isSmall ? 0.7 : 1)), bMin: 5, bMax: 7, spread: 0.19, shape: 0.85, droop: 0.32, thick: 0.34, crown: 0.34, top: 0.97, topR: 0.005, baseR: 0.021, flare: 0 }),
+        new THREE.MeshLambertMaterial({ vertexColors: true }));
+      layDown(fallen, fFrom.clone(), fDir, FH, 0.55);   // the butt rests at stump height, the rest propped on its branches
+      fallen.scale.set(FW, FH, FW * 0.45);   // branches squashed flat against the ground, still spread sideways
+      fallen.castShadow = true; fallen.receiveShadow = true; scene.add(fallen);
+      { const butt = new THREE.Group(); butt.position.copy(fallen.position); butt.quaternion.copy(fallen.quaternion); scene.add(butt);
+        const sg = splinters(7, 0.26, 0, 0.5, woodC); sg.rotateX(Math.PI); mk(sg, woodMat, 0, 0, 0, butt);
+        const face = new THREE.CircleGeometry(0.26, 14); face.rotateX(Math.PI / 2); paint(face, c => c.copy(woodC).multiplyScalar(rand(0.85, 1.05))); mk(face, woodMat, 0, 0, 0, butt); }
+      // the birds like a fallen log and a stump as much as a rock
+      fallen.updateMatrixWorld(true);
+      PERCHES.push({ p: stump.position.clone().add(new THREE.Vector3(0, 0.68, 0)), taken: null });
+      for (const d of [1.6, 3.4]) { const q = fallen.localToWorld(new THREE.Vector3(0, d / FH, 0)); q.y += 0.021 * FW * (1 - 0.75 * d / FH); PERCHES.push({ p: q, taken: null }); }
+      for (let d = 0.8; d < FH * 0.92; d += 0.9) {
+        const tt = d / FH, half = Math.max(0.5, 0.19 * FW * Math.pow(Math.max(0, 1 - tt), 0.85) * (tt > 0.3 ? 0.85 : 0));
+        OBST.push({ x: fFrom.x + fDir.x * d, z: fFrom.z + fDir.z * d, r: half, type: 'tree' });
+      }
+    }
     // firelight
     W.fire1 = new THREE.PointLight(lin(0xff7a2a), 5, 26, 2); W.fire1.position.copy(gapP).add(new THREE.Vector3(0, 1.1, 0));
     if (!isSmall) { W.fire1.castShadow = true; W.fire1.shadow.mapSize.set(512, 512); W.fire1.shadow.bias = -0.006; W.fire1.shadow.camera.near = 0.3; W.fire1.shadow.camera.far = 26; }
@@ -1854,12 +2130,15 @@ export function createScene(stage, { onHud = () => {} } = {}) {
         spL[i] = spM[i] = rand(0.35, 1.1);
       }
     }
+    mergeRig(W.root, { keep: [W.panelLight, W.navLight, W.beacon, ...W.engineGlow] });
     W.status = 'Burning';
     W.update = (dt, t) => {
       pU.uMoon.value = state.moonGain;
       const fl1 = 0.75 + Math.sin(t * 9.3) * 0.12 + Math.sin(t * 23.1) * 0.08 + Math.random() * 0.12;
       const fl2 = 0.75 + Math.sin(t * 11.7 + 1) * 0.12 + Math.sin(t * 19.3) * 0.08 + Math.random() * 0.12;
       W.fire1.intensity = 4.2 * fl1; W.fire2.intensity = 2.8 * fl2;
+      const smoulder = 0.7 + 0.3 * Math.sin(t * 1.9) * Math.sin(t * 3.7) + Math.random() * 0.12;
+      W.snagLight.intensity = 1.3 * smoulder; W.coalMat.color.setRGB(2.4, 0.7, 0.15).multiplyScalar(0.55 + 0.6 * smoulder);
       heatU.value = 0.65 + 0.35 * Math.sin(t * 1.3) + Math.random() * 0.1;
       W.emberMat.color.setRGB(2.4, 0.7, 0.15).multiplyScalar(0.6 + 0.4 * Math.sin(t * 1.7) * Math.sin(t * 2.9) + Math.random() * 0.15);
       W.engineGlow.forEach((g, i) => g.material.color.setRGB(2.2, 0.55, 0.12).multiplyScalar(0.55 + 0.45 * Math.sin(t * 0.8 + i)));
@@ -1899,6 +2178,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     return W;
   })();
 
+  await step('Calling the wildlife', 0.76);
   // ======================================================================
   // WILDLIFE: a stag and a doe that graze, wander, look up and bolt; two red squirrels that forage and climb
   // ======================================================================
@@ -1990,7 +2270,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     mk(new THREE.SphereGeometry(0.048, 12, 8), new THREE.MeshStandardMaterial({ color: lin(0xf6f1e8), roughness: 0.95 }), 0, -0.07, 0.008, tail).scale.set(0.8, 1.45, 0.4);
     g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
     g.scale.setScalar(stag ? 1.0 : 0.88);
-    scene.add(g);
+    mergeRig(g, { bones: rigParts(body, neck, head, ears, tail, fl, fr, hl, hr) }); scene.add(g);
     return { g, body, neck, head, ears, tail, fl, fr, hl, hr, eyeMat };
   }
   function deerLeg(L, p, front, amp, run) {
@@ -2052,7 +2332,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       tail.push(sg); parent = sg;
     });
     g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
-    scene.add(g);
+    mergeRig(g, { bones: rigParts(body, head, paws, tail) }); scene.add(g);
     return { g, body, head, paws, tail };
   }
   function nearestTree(x, z, maxD = 1e9) {
@@ -2106,7 +2386,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     for (const s of [-1, 1]) mk(new THREE.CylinderGeometry(0.003, 0.003, 0.03, 5), horn, 0.014 * s, -0.015, 0, legs);
     g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
     g.scale.setScalar(1.3);
-    scene.add(g);
+    mergeRig(g, { bones: rigParts(body, head, wings, tail, legs) }); scene.add(g);
     return { g, body, head, wings, tail, legs };
   }
   const BIRD_FOOT = 0.07;   // body centre sits this high above whatever it stands on
@@ -2360,6 +2640,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     M.body.rotation.x = B.landed ? (peck ? 0.35 : -0.12) : B.pitch;
   }
 
+  await step('Setting the lens', 0.83);
   // ======================================================================
   // POST-PROCESSING
   // ======================================================================
@@ -2528,6 +2809,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     return { setAmount, update };
   })();
 
+  await step('Charting paths', 0.86);
   // ======================================================================
   // STATE & CONTROLS
   // ======================================================================
@@ -2584,7 +2866,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   function firstBlocker(ax, az, bx, bz) {
     const n = Math.ceil(Math.hypot(bx - ax, bz - az) / 0.3);
     for (let k = 1; k < n; k++) { const t = k / n, x = ax + (bx - ax) * t, z = az + (bz - az) * t;
-      if (crashBlocked(x, z, 0.3)) return 'wreck'; const o = obstacleHit(x, z, 0.4); if (o) return o.type === 'fire' ? 'fire' : o.type === 'wreckage' ? 'wreck' : 'rocks'; }
+      if (crashBlocked(x, z, 0.3)) return 'wreck'; const o = obstacleHit(x, z, 0.4); if (o) return o.type === 'fire' ? 'fire' : o.type === 'wreckage' ? 'wreck' : o.type === 'tree' ? 'fallen tree' : 'rocks'; }
     return null;
   }
   const state = {
@@ -2653,7 +2935,8 @@ export function createScene(stage, { onHud = () => {} } = {}) {
 
   function tick() {
     if (disposed) return;
-    const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+    const raw = clock.getDelta(), dt = Math.min(raw, 0.05), t = clock.elapsedTime;
+    adaptQuality(raw, t);
     veg.uTime.value = t; skyUniforms.uTime.value = t;
     prev.copy(state.pos);
 
@@ -2921,20 +3204,87 @@ export function createScene(stage, { onHud = () => {} } = {}) {
     if (flags !== hudFlags || t - hudAt > 0.15) { hudFlags = flags; hudAt = t; onHud(hud); }
     rain.update(dt, t);
 
+    updateVegLOD(camera.position);
+    updateShadowMaps();
     if (composer) { outPass.uniforms.uTime.value = t % 10; composer.render(); } else renderer.render(scene, camera);
     rafId = requestAnimationFrame(tick);
   }
-  tick();
 
-  on(window, 'resize', () => {
+  // ---------- shadow-map updates ----------
+  // A point light's shadow is six extra renders of every caster near it, every frame. The fire never moves and nearly
+  // everything it lights is static, so its map is redrawn only while something that moves is close enough for its
+  // shadow to show (the fire's light is ~3% of its near-field strength beyond 12 m), plus a refresh every 20 frames.
+  // The lantern's map isn't redrawn while the lamp is off: its light is zero then, so the map is never seen.
+  const fireShadow = wreck.fire1 && wreck.fire1.castShadow ? wreck.fire1.shadow : null;
+  const lampShadow = lantern.userData.light.shadow;
+  if (fireShadow) fireShadow.autoUpdate = false;
+  lampShadow.autoUpdate = false;
+  let shadowFrame = 0;
+  function updateShadowMaps() {
+    shadowFrame++;
+    lampShadow.needsUpdate = state.lamp;
+    if (!fireShadow) return;
+    // something that moves, near the fire, and has moved since the fire's map was last drawn
+    let stale = shadowFrame % 20 === 1;
+    for (const [o, r2] of fireMovers) {
+      if (stale) break;
+      const last = o.userData.fireSeen || (o.userData.fireSeen = new THREE.Vector3(1e9, 0, 0));
+      stale = o.position.distanceToSquared(fireP) < r2 && o.position.distanceToSquared(last) > 1e-4;
+    }
+    fireShadow.needsUpdate = stale;
+    if (stale) for (const [o] of fireMovers) (o.userData.fireSeen || (o.userData.fireSeen = new THREE.Vector3())).copy(o.position);
+  }
+  // big movers count within 12 m of the fire; a squirrel's or bird's shadow is too small to see beyond 5 m
+  const fireP = wreck.fire1.position;
+  const fireMovers = [[astro, 144], [dog, 144], ...wild.deer.map(A => [A.m.g, 144]), ...wild.squirrels.map(Sq => [Sq.m.g, 25]), ...birds.map(B => [B.m.g, 25])];
+
+  function resize() {
     const w = stage.clientWidth, h = stage.clientHeight;
     camera.aspect = w / h; camera.updateProjectionMatrix();
     renderer.setSize(w, h);
     if (composer) { composer.setSize(w, h); bloom.setSize(w, h); }
     wreck.resize();
-  });
+  }
+  on(window, 'resize', resize);
+
+  // ---------- adaptive quality ----------
+  // Full quality whenever the GPU keeps up. If frames run long (under ~45 fps) for a few seconds, step down one notch
+  // of a ladder, cheapest-to-lose first: pixel density on a HiDPI screen down to 1.25, then the density of grass beyond
+  // 14 m (down to half), then pixel density down to 1. After a long stretch at full speed, step back up.
+  // Fast hardware never leaves the top rung.
+  const ladder = [];
+  for (let pr = PR_MAX; pr >= Math.min(PR_MAX, 1.25) - 1e-6; pr -= 0.25) ladder.push([pr, 1]);
+  for (const vd of [0.8, 0.65, 0.5]) ladder.push([ladder[ladder.length - 1][0], vd]);
+  for (let pr = ladder[ladder.length - 1][0] - 0.25; pr >= PR_MIN - 1e-6; pr -= 0.25) ladder.push([pr, 0.5]);
+  let rung = 0, frameAvg = 1 / 60, rungAt = 0, droppedAt = -1e9;
+  function adaptQuality(raw, t) {
+    if (raw > 0.25) return;                       // tab was hidden or the page stalled: not a rendering signal
+    frameAvg += (raw - frameAvg) * 0.04;
+    if (t - rungAt < 2.5) return;
+    let next = rung;
+    if (frameAvg > 1 / 45 && rung < ladder.length - 1) { next = rung + 1; droppedAt = t; }
+    else if (frameAvg < 1 / 57 && rung > 0 && t - droppedAt > 20) next = rung - 1;
+    if (next === rung) return;
+    rung = next; rungAt = t; frameAvg = 1 / 60;
+    const [pr, vd] = ladder[rung];
+    vegDensity = vd;
+    if (pr !== PR) { PR = pr; prU.value = PR; renderer.setPixelRatio(PR); if (composer) composer.setPixelRatio(PR); resize(); }
+  }
+
+  // Compile every shader now, behind the loading screen, instead of stalling the first frames on screen (on Windows,
+  // where browsers translate shaders to Direct3D, the first visit spends seconds here; the browser's shader cache makes
+  // repeat visits fast). Skipping three.js's per-program error check outside development avoids extra driver round-trips.
+  await step('Compiling shaders', 0.88);
+  renderer.debug.checkShaderErrors = !!import.meta.env.DEV;
+  renderer.compile(scene, camera);
+  await step('First light', 0.97);
+  tick();
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));   // the first frames (and their shadow shaders) are done
+  onProgress(1, 'Ready');
+  buildLog.push([buildLabel + ' + first frames', Math.round(performance.now() - buildT)]);
 
   return {
+    buildLog,
     setAuto, setLamp, setFollow, moonView,
     // toggles read the engine's own state, so they can't act on a stale copy in React
     toggleAuto: () => setAuto(!state.auto),

@@ -1,33 +1,46 @@
-import { useEffect, useRef } from 'react';
-import { createScene } from '../scene/engine.js';
+import { useEffect, useRef, useState } from 'react';
+
+// The engine (and three.js with it) is a separate chunk. Requesting it as soon as this module loads lets it download
+// while React paints the page, instead of holding the whole page back until the 3D code has arrived.
+const engineModule = import('../scene/engine.js');
 
 // Owns the <canvas>. The engine is imperative, so React only mounts it once
 // and tears it down on unmount; everything else flows through callbacks.
-export default function Scene({ onReady, onError, onHud }) {
+export default function Scene({ onReady, onError, onHud, onProgress }) {
   const stageRef = useRef(null);
-  // Keep the latest onHud without restarting the engine when the prop changes.
-  const onHudRef = useRef(onHud);
-  onHudRef.current = onHud;
+  const [shown, setShown] = useState(false);
+  // Keep the latest callbacks without restarting the engine when the props change.
+  const cb = useRef({ onHud, onProgress });
+  cb.current = { onHud, onProgress };
 
   useEffect(() => {
-    let engine = null;
-    // Defer one tick so the loading screen paints before the heavy scene build.
-    const id = setTimeout(() => {
+    let engine = null, cancelled = false;
+    (async () => {
       try {
-        engine = createScene(stageRef.current, { onHud: hud => onHudRef.current(hud) });
-        onReady(engine);
+        const { createScene } = await engineModule;
+        if (cancelled) return;
+        const e = await createScene(stageRef.current, {
+          onHud: hud => cb.current.onHud(hud),
+          onProgress: (f, label) => cb.current.onProgress?.(f, label),
+          isCancelled: () => cancelled
+        });
+        if (cancelled) { e.dispose(); return; }
+        engine = e;
+        setShown(true);
+        onReady(e);
       } catch (err) {
+        if (cancelled || err.cancelled) return;
         console.error(err);
         onError(err);
       }
-    }, 40);
+    })();
 
     return () => {
-      clearTimeout(id);
+      cancelled = true;
       if (engine) engine.dispose();
       onReady(null);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return <div className="stage" ref={stageRef} />;
+  return <div className={shown ? 'stage shown' : 'stage'} ref={stageRef} />;
 }

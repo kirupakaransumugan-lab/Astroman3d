@@ -18,7 +18,8 @@ img { max-width: 100%; }
 html, body { height: 100%; }
 body { background: var(--night); color: var(--ink); font-family: var(--body); overflow: hidden; }
 .stage { position: fixed; inset: 0; }   /* full screen: the scene shows through the transparent navbar */
-.stage canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+.stage canvas { display: block; width: 100%; height: 100%; touch-action: none; opacity: 0; transition: opacity 0.9s ease; }
+.stage.shown canvas { opacity: 1; }   /* the scene fades in once its first frames are drawn */
 
 .tag, .hud, .dock { position: fixed; z-index: 2; background: var(--panel); border: 1px solid var(--line);
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border-radius: 10px; }
@@ -39,7 +40,8 @@ body { background: var(--night); color: var(--ink); font-family: var(--body); ov
   width: max-content; max-width: calc(100vw - 32px); }
 .dock button { font-family: var(--display); font-weight: 500; font-size: 13px; letter-spacing: 0.06em; text-transform: uppercase;
   color: var(--ink); background: transparent; border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; cursor: pointer; }
-.dock button:hover { border-color: var(--amber-deep); }
+.dock button:hover:not(:disabled) { border-color: var(--amber-deep); }
+.dock button:disabled, .dock input:disabled { opacity: 0.5; cursor: default; }
 .dock button:focus-visible, .dock input:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .dock button[aria-pressed="true"] { background: var(--amber); color: #1a1006; border-color: var(--amber); }
 .dock label { display: flex; align-items: center; gap: 8px; padding: 0 6px; font-family: var(--display); font-size: 12px;
@@ -48,10 +50,16 @@ body { background: var(--night); color: var(--ink); font-family: var(--body); ov
 .hint { position: fixed; z-index: 2; left: 50%; transform: translateX(-50%); bottom: calc(80px + env(safe-area-inset-bottom, 0px));
   font-size: 12px; color: var(--muted); text-align: center; width: max-content; max-width: calc(100vw - 32px);
   text-shadow: 0 1px 4px #000; pointer-events: none; transition: opacity 1s; }
-.loading { position: fixed; inset: 0; z-index: 5; display: grid; place-items: center; background: var(--night);
+/* sits under the panels (z-index 2), so the page UI is readable while the scene builds */
+.loading { position: fixed; inset: 0; z-index: 1; display: grid; place-items: center; background: var(--night); transition: opacity 0.8s ease;
   font-family: var(--display); letter-spacing: 0.12em; text-transform: uppercase; font-size: 13px; color: var(--muted); text-align: center; padding-inline: 16px; }
 .loading[hidden] { display: none; }
 .loading b { display: block; color: var(--amber); font-weight: 500; margin-bottom: 6px; }
+.loading.done { opacity: 0; pointer-events: none; }
+.loading .bar { display: block; width: min(260px, 70vw); height: 3px; margin: 14px auto 8px; background: var(--line); border-radius: 2px; overflow: hidden; }
+.loading .bar i { display: block; height: 100%; background: var(--amber); transform-origin: left; transition: transform 0.35s ease; }
+.loading small { font-size: 11px; color: var(--muted); letter-spacing: 0.2em; }
+@media (prefers-reduced-motion: reduce) { .stage canvas, .loading, .loading .bar i { transition: none; } }
 
 /* ---------- site chrome: navbar + watermark ---------- */
 .navbar { position: fixed; top: 0; left: 0; right: 0; z-index: 10; height: var(--nav-h); box-sizing: border-box;

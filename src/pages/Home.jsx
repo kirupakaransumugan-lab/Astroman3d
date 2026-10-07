@@ -14,6 +14,14 @@ export default function Home() {
   const [failed, setFailed] = useState(false);
   const [hud, setHud] = useState(INITIAL_HUD);
   const [hintVisible, setHintVisible] = useState(true);
+  const [progress, setProgress] = useState({ f: 0, label: 'Loading the scene' });
+  // the loading panel fades out once the scene is up, then unmounts
+  const [loaderGone, setLoaderGone] = useState(false);
+  useEffect(() => {
+    if (!engine) return;
+    const id = setTimeout(() => setLoaderGone(true), 900);
+    return () => clearTimeout(id);
+  }, [engine]);
 
   useEffect(() => {
     const id = setTimeout(() => setHintVisible(false), 10000);
@@ -22,15 +30,22 @@ export default function Home() {
 
   return (
     <>
-      <Scene onReady={setEngine} onError={() => setFailed(true)} onHud={setHud} />
+      <Scene onReady={setEngine} onError={() => setFailed(true)} onHud={setHud}
+        onProgress={(f, label) => setProgress({ f, label })} />
 
-      {!engine && (
-        <div className="loading">
+      {!loaderGone && (
+        <div className={engine ? 'loading done' : 'loading'} aria-live="polite" aria-busy={!engine}>
           <div>
             <b>Astro Walk</b>
             {failed
               ? 'This scene needs WebGL, which your browser could not start. Try a recent Chrome, Edge, Firefox or Safari.'
-              : 'Growing the meadow and planting the pines…'}
+              : <>
+                  {progress.label}…
+                  <span className="bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress.f * 100)}>
+                    <i style={{ transform: `scaleX(${progress.f})` }} />
+                  </span>
+                  <small>{Math.round(progress.f * 100)}%</small>
+                </>}
           </div>
         </div>
       )}

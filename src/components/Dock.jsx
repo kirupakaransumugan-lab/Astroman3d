@@ -1,10 +1,10 @@
 import { useState } from 'react';
 
-function Slider({ id, label, min, max, step, value, onChange }) {
+function Slider({ id, label, min, max, step, value, onChange, disabled }) {
   return (
     <label htmlFor={id}>
       {label}
-      <input id={id} type="range" min={min} max={max} step={step} value={value}
+      <input id={id} type="range" min={min} max={max} step={step} value={value} disabled={disabled}
         onChange={e => onChange(parseFloat(e.target.value))} />
     </label>
   );
@@ -35,13 +35,13 @@ export default function Dock({ engine, hud }) {
       <button disabled={disabled} onClick={() => engine.toggleSit()}>
         {hud.seated ? 'Stand up' : 'Sit at edge'}
       </button>
-      <Slider id="glow" label="Lamp" min={0.3} max={2} step={0.05} value={glow}
+      <Slider disabled={disabled} id="glow" label="Lamp" min={0.3} max={2} step={0.05} value={glow}
         onChange={v => { setGlow(v); engine?.setGlow(v); }} />
-      <Slider id="moonlight" label="Moon" min={0.3} max={2} step={0.05} value={moon}
+      <Slider disabled={disabled} id="moonlight" label="Moon" min={0.3} max={2} step={0.05} value={moon}
         onChange={v => { setMoon(v); engine?.setMoonGain(v); }} />
-      <Slider id="clouds" label="Clouds" min={0} max={1} step={0.05} value={clouds}
+      <Slider disabled={disabled} id="clouds" label="Clouds" min={0} max={1} step={0.05} value={clouds}
         onChange={v => { setClouds(v); engine?.setClouds(v); }} />
-      <Slider id="rain" label="Rain" min={0} max={1} step={0.05} value={rain}
+      <Slider disabled={disabled} id="rain" label="Rain" min={0} max={1} step={0.05} value={rain}
         onChange={v => { setRain(v); engine?.setRain(v); }} />
     </div>
   );

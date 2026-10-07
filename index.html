@@ -7,9 +7,14 @@
 <meta property="og:title" content="Astro Walk">
 <meta property="og:description" content="An interactive 3D night scene built with three.js and React. Drag to look around, WASD to walk.">
 <meta name="theme-color" content="#050810">
+<style>html,body{background:#050810;margin:0}</style>
 <title>Astro Walk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=Manrope:wght@400;600&display=swap">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- fonts load without blocking the first paint (text shows in the fallback face, then swaps) -->
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=Manrope:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=Manrope:wght@400;600&display=swap" media="print" onload="this.media='all'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=Manrope:wght@400;600&display=swap"></noscript>
 </head>
 <body>
 <div id="root"></div>
