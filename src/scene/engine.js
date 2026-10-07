@@ -142,7 +142,7 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   function start() {
   const listeners = [];
   const on = (target, type, fn) => { target.addEventListener(type, fn); listeners.push([target, type, fn]); };
-  let rafId = 0, disposed = false;
+  let rafId = 0, disposed = false, hudAt = -1, hudFlags = '';
   // ---------- renderer ----------
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
   // Render at the screen's full pixel density for a sharp image (capped at 2; beyond that the extra cost isn't visible).
@@ -2231,6 +2231,144 @@ export function createScene(stage, { onHud = () => {} } = {}) {
   }
 
   // ======================================================================
+  // RAIN: drop sizes follow the Marshall–Palmer distribution, every drop falls at its own
+  // terminal velocity (Atlas et al. 1973) and drifts with the wind; drops hitting the ground
+  // throw secondary droplets on ballistic arcs. Drops only show where light reaches them.
+  // ======================================================================
+  const rain = (() => {
+    const BOX = 26, H = 16;                       // world-anchored volume of drops kept around the camera (m)
+    const MAX = Math.round(26000 * (isSmall ? 0.45 : 1));
+    const D_MIN = 0.5, D_MAX = 3.5;               // mm; smaller drops are too faint to see as streaks
+    const EXPOSURE = 1 / 40;                      // streak = distance fallen in this "shutter" time, as the eye sees rain
+    const G = 9.81;
+    const WIND_DIR = new THREE.Vector2(1, 0.45).normalize(); // same direction the grass bends
+    const vTerm = D => 9.65 - 10.3 * Math.exp(-0.6 * D);    // terminal velocity, m/s (D in mm)
+    const rateOf = a => 12 * a * a;                          // slider 0..1 → rainfall rate in mm/h
+    const lambdaOf = R => 4.1 * Math.pow(Math.max(R, 0.05), -0.21); // Marshall–Palmer slope, mm⁻¹
+    // Visible drops per m³ ∝ ∫_{D_MIN}^∞ e^(−ΛD) dD; normalised so the heaviest setting uses the whole pool.
+    const visDensity = R => { const l = lambdaOf(R); return Math.exp(-l * D_MIN) / l; };
+    const sampleD = l => D_MIN - Math.log(1 - Math.random() * (1 - Math.exp(-l * (D_MAX - D_MIN)))) / l;
+
+    const lightU = {
+      uL0: { value: new THREE.Vector3() }, uC0: { value: new THREE.Vector3() },
+      uL1: { value: new THREE.Vector3() }, uC1: { value: new THREE.Vector3() },
+      uL2: { value: new THREE.Vector3() }, uC2: { value: new THREE.Vector3() },
+      uAmb: { value: new THREE.Vector3() }, uCam: { value: new THREE.Vector3() }
+    };
+    // Raindrops scatter light strongly forward: a drop between you and a lamp glints, one beside it barely shows.
+    const LIGHT_GLSL = `uniform vec3 uL0, uC0, uL1, uC1, uL2, uC2, uAmb, uCam;
+      vec3 dropLight(vec3 L, vec3 C, vec3 p, vec3 vd){ vec3 d = L - p; float r2 = dot(d, d); vec3 ld = d * inversesqrt(r2);
+        float ph = 0.18 + 2.4 * pow(max(dot(vd, ld), 0.0), 6.0); return C * ph / (1.0 + 1.6 * r2); }
+      vec3 rainLight(vec3 p){ vec3 vd = normalize(p - uCam);
+        return uAmb + dropLight(uL0, uC0, p, vd) + dropLight(uL1, uC1, p, vd) + dropLight(uL2, uC2, p, vd); }`;
+
+    // ----- falling drops: line segments, head + tail vertex per drop, animated entirely on the GPU -----
+    const seed = new Float32Array(MAX * 6), aEnd = new Float32Array(MAX * 2), aD = new Float32Array(MAX * 2);
+    for (let i = 0; i < MAX; i++) {
+      const x = Math.random(), y = Math.random(), z = Math.random();
+      seed.set([x, y, z, x, y, z], i * 6); aEnd[i * 2 + 1] = 1;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(seed, 3));
+    g.setAttribute('aEnd', new THREE.BufferAttribute(aEnd, 1));
+    const dAttr = new THREE.BufferAttribute(aD, 1); g.setAttribute('aD', dAttr);
+    const U = Object.assign({ uT: { value: 0 }, uWindOff: { value: new THREE.Vector2() }, uWindVel: { value: new THREE.Vector2() },
+      uBox: { value: BOX }, uH: { value: H }, uExp: { value: EXPOSURE }, uGain: { value: 1 } }, lightU);
+    const mat = new THREE.ShaderMaterial({
+      uniforms: U, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      vertexShader: `uniform vec3 uCam; uniform vec2 uWindOff, uWindVel; uniform float uT, uBox, uH, uExp;
+        attribute float aEnd, aD; varying vec3 vW; varying float vA;
+        void main(){
+          float vt = 9.65 - 10.3 * exp(-0.6 * aD);
+          vec3 p;  // fixed in the world, wrapped into a box that travels with the camera
+          p.x = uCam.x + mod(position.x * uBox + uWindOff.x - uCam.x + 0.5 * uBox, uBox) - 0.5 * uBox;
+          p.z = uCam.z + mod(position.z * uBox + uWindOff.y - uCam.z + 0.5 * uBox, uBox) - 0.5 * uBox;
+          p.y = uCam.y + mod(position.y * uH - vt * uT - uCam.y + 0.5 * uH, uH) - 0.5 * uH;
+          p -= vec3(uWindVel.x, -vt, uWindVel.y) * uExp * aEnd;   // tail = where the drop was one exposure ago
+          vW = p;
+          float dc = distance(p, uCam);
+          vA = smoothstep(0.3, 1.0, dc) * (1.0 - smoothstep(uBox * 0.28, uBox * 0.5, dc))
+             * (0.35 + 0.65 * aD / 2.0) * (1.0 - 0.55 * aEnd);   // bigger drops scatter more; head brighter than tail
+          gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0); }`,
+      fragmentShader: `uniform float uGain; varying vec3 vW; varying float vA; ${LIGHT_GLSL}
+        void main(){ gl_FragColor = vec4(rainLight(vW) * vA * uGain * 0.65, 1.0); }`
+    });
+    const drops = new THREE.LineSegments(g, mat); drops.frustumCulled = false; drops.renderOrder = 7; scene.add(drops);
+
+    // ----- splashes: secondary droplets on ballistic arcs (CPU, small pool) -----
+    const SP = isSmall ? 400 : 1000;
+    const sPos = new Float32Array(SP * 3).fill(-1e4), sVel = new Float32Array(SP * 3), sFloor = new Float32Array(SP), sLife = new Float32Array(SP);
+    const sg = new THREE.BufferGeometry(); const sAttr = new THREE.BufferAttribute(sPos, 3); sAttr.setUsage(THREE.DynamicDrawUsage);
+    sg.setAttribute('position', sAttr);
+    const sm = new THREE.ShaderMaterial({
+      uniforms: Object.assign({ uPR: prU, uGain: U.uGain }, lightU), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      vertexShader: `uniform float uPR; varying vec3 vW; void main(){ vW = position; vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mv; gl_PointSize = clamp(uPR * 5.0 / -mv.z, 1.0, 3.0 * uPR); }`,
+      fragmentShader: `uniform float uGain; varying vec3 vW; ${LIGHT_GLSL}
+        void main(){ vec2 q = gl_PointCoord - 0.5; float a = smoothstep(0.25, 0.1, dot(q, q));
+          gl_FragColor = vec4(rainLight(vW) * a * uGain * 0.5, 1.0); }`
+    });
+    const splashes = new THREE.Points(sg, sm); splashes.frustumCulled = false; splashes.renderOrder = 7; scene.add(splashes);
+    let sNext = 0, sAcc = 0;
+    function splash(x, z, l) {
+      const y = heightAt(x, z), v = vTerm(sampleD(l)), n = 2 + (Math.random() * 4 | 0);
+      for (let k = 0; k < n; k++) {
+        const i = sNext; sNext = (sNext + 1) % SP;
+        const th = Math.random() * Math.PI * 2, el = (35 + Math.random() * 40) * Math.PI / 180;
+        const sp = v * (0.12 + Math.random() * 0.18);   // ejecta leave at a fraction of the impact speed
+        sPos[i * 3] = x; sPos[i * 3 + 1] = y + 0.005; sPos[i * 3 + 2] = z;
+        sVel[i * 3] = Math.cos(th) * Math.cos(el) * sp; sVel[i * 3 + 1] = Math.sin(el) * sp; sVel[i * 3 + 2] = Math.sin(th) * Math.cos(el) * sp;
+        sFloor[i] = y; sLife[i] = 1;
+      }
+    }
+
+    const R = { amount: 0, rate: 0, lambda: 4.1, windOff: new THREE.Vector2() };
+    function setAmount(a) {
+      R.amount = a; R.rate = rateOf(a); R.lambda = lambdaOf(R.rate);
+      for (let i = 0; i < MAX; i++) { const D = sampleD(R.lambda); aD[i * 2] = aD[i * 2 + 1] = D; }
+      dAttr.needsUpdate = true;
+      const n = a <= 0 ? 0 : Math.round(MAX * Math.min(1, visDensity(R.rate) / visDensity(rateOf(1))));
+      g.setDrawRange(0, n * 2);
+      drops.visible = splashes.visible = n > 0;
+    }
+    const lampLight = lantern.userData.light;
+    function setLight(L, C, light) { light.getWorldPosition(L.value); C.value.set(light.color.r, light.color.g, light.color.b).multiplyScalar(light.intensity); }
+
+    function update(dt, t) {
+      if (!drops.visible) return;
+      // gusty wind: drops pick up the air's horizontal speed within a fraction of a second, so they move with it
+      const ws = 1.3 * (1 + 0.3 * Math.sin(t * 0.23) + 0.15 * Math.sin(t * 0.61 + 2));
+      U.uWindVel.value.copy(WIND_DIR).multiplyScalar(ws);
+      R.windOff.addScaledVector(U.uWindVel.value, dt);
+      R.windOff.set(R.windOff.x % BOX, R.windOff.y % BOX);
+      U.uWindOff.value.copy(R.windOff);
+      U.uT.value = t % 1000;
+      lightU.uCam.value.copy(camera.position);
+      setLight(lightU.uL0, lightU.uC0, lampLight);
+      setLight(lightU.uL1, lightU.uC1, wreck.fire1);
+      setLight(lightU.uL2, lightU.uC2, wreck.fire2);
+      lightU.uAmb.value.set(0.16, 0.19, 0.26).multiplyScalar(state.moonGain);
+
+      // splashes: impacts land on the ground near the astronaut, at a rate that scales with the rainfall
+      sAcc += R.rate * 70 * dt;
+      while (sAcc >= 1) {
+        sAcc--;
+        const a = Math.random() * Math.PI * 2, rr = 6 * Math.sqrt(Math.random());
+        splash(controls.target.x + Math.cos(a) * rr, controls.target.z + Math.sin(a) * rr, R.lambda);
+      }
+      for (let i = 0; i < SP; i++) {
+        if (sLife[i] <= 0) continue;
+        sVel[i * 3 + 1] -= G * dt;
+        sPos[i * 3] += sVel[i * 3] * dt; sPos[i * 3 + 1] += sVel[i * 3 + 1] * dt; sPos[i * 3 + 2] += sVel[i * 3 + 2] * dt;
+        if (sPos[i * 3 + 1] < sFloor[i]) { sLife[i] = 0; sPos[i * 3 + 1] = -1e4; }
+      }
+      sAttr.needsUpdate = true;
+    }
+    setAmount(0.3);
+    return { setAmount, update };
+  })();
+
+  // ======================================================================
   // STATE & CONTROLS
   // ======================================================================
   const NAV = (() => {
@@ -2617,7 +2755,10 @@ export function createScene(stage, { onHud = () => {} } = {}) {
       dog: D.sit > 0.6 ? 'Sitting' : D.speed > 1.6 ? 'Catching up' : D.speed > 0.1 ? 'Following' : 'Waiting',
       auto: state.auto, lamp: state.lamp, follow: state.follow
     };
-    // TODO(human): push `hud` to React via onHud(hud) — but not every frame.
+    // Push to React immediately when a toggle changes (so buttons respond at once), otherwise ~7 times a second.
+    const flags = `${hud.auto}|${hud.lamp}|${hud.follow}|${hud.seated}`;
+    if (flags !== hudFlags || t - hudAt > 0.15) { hudFlags = flags; hudAt = t; onHud(hud); }
+    rain.update(dt, t);
 
     if (composer) { outPass.uniforms.uTime.value = t % 10; composer.render(); } else renderer.render(scene, camera);
     rafId = requestAnimationFrame(tick);
@@ -2634,6 +2775,11 @@ export function createScene(stage, { onHud = () => {} } = {}) {
 
   return {
     setAuto, setLamp, setFollow, moonView,
+    // toggles read the engine's own state, so they can't act on a stale copy in React
+    toggleAuto: () => setAuto(!state.auto),
+    toggleLamp: () => setLamp(!state.lamp),
+    toggleFollow: () => setFollow(!state.follow),
+    setRain: v => rain.setAmount(v),
     toggleSit: () => toggleSit(false),
     setGlow: v => { state.glow = v; },
     setMoonGain: v => { state.moonGain = v; },
